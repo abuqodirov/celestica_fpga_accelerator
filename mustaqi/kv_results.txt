@@ -1,0 +1,3 @@
+kv f32: perplexity 3.269 over 2215 tokens (0.25 s/token)
+kv q8: perplexity 3.272 over 2215 tokens (0.26 s/token)
+kv q4: perplexity 3.290 over 2215 tokens (0.25 s/token)

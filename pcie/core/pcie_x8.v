@@ -1,0 +1,369 @@
+// PCIe Gen1 x8 endpoint core for the card (XC7K480T): 8 GTX lanes + the PCIE_2_1 hard block + its buffer RAMs,
+// taken unchanged from the stage 2/3a test design (../s2/s2_top.v, linked with the PC and passed the BAR0 tests on
+// 2026-11-02) minus its JTAG debug logic. The user side is the block's 128-bit TRN interface on pclk (125 MHz).
+// Needs: ../factory_params.vh (GT parameters), pcie_x8_params.vh (block parameters, = ../s2/s2_params.vh),
+// pcie_x8_inst.vh (gen_pcie_inst_core.py), and in the bitstream flow ../fasm_patch.py (quad 115 refclk) and
+// ../s2/delay_patch.py (PIPE / TRN input delays, needs the post-route pin map).
+// Clocks: CFGMCLK (~64 MHz, sclk) runs the reset sequencer; lane 0 TXOUTCLK = 100 MHz reference (refclk_fab)
+// -> PLL -> pclk 125 MHz (PIPE clock, USERCLK2, TX alignment) and userclk 250 MHz (block core + buffer RAMs).
+`include "factory_params.vh"
+`include "pcie_x8_params.vh"
+
+module pcie_x8 (
+    input  wire         refclk_p, refclk_n,       // J8/J7 = MGTREFCLK0_116
+    input  wire [7:0]   rxp, rxn,
+    output wire [7:0]   txp, txn,
+    input  wire         perst_n,                  // Y26
+    input  wire         restart_t,                // toggle (any clock): rerun the lane reset sequence
+    output wire         pclk,
+    output wire         user_rst_n,               // pclk domain: TRN user logic reset (active low)
+    output wire         lnk_up,                   // TRN link up (pclk)
+    // TRN receive (pclk)
+    output wire [127:0] trn_rd,
+    output wire         trn_rsof, trn_reof, trn_rsrc_rdy, trn_rsrc_dsc,
+    output wire [1:0]   trn_rrem,
+    output wire [7:0]   trn_rbar_hit,
+    input  wire         trn_rdst_rdy,
+    // TRN transmit (pclk)
+    input  wire [127:0] trn_td,
+    input  wire         trn_tsof, trn_teof, trn_tsrc_rdy,
+    input  wire [1:0]   trn_trem,
+    output wire         trn_tdst_rdy,
+    output wire [5:0]   trn_tbuf_av,
+    // status (slowly changing; sample in any clock domain)
+    output wire [5:0]   ltssm,
+    output wire [3:0]   seq_st, seq_err, tx_al_st, tx_al_err,
+    output wire [3:0]   neg_width,
+    output wire [1:0]   cur_speed,
+    output wire         bm_en, mem_en,
+    output wire [127:0] ev_count                  // 8 x 16-bit saturating counters, order: see EV below
+);
+    // ------------------------------------------------------------------ clocks
+    wire cfgmclk, sclk;
+    STARTUPE2 startup (
+        .CFGCLK(), .CFGMCLK(cfgmclk), .EOS(), .PREQ(),
+        .CLK(1'b0), .GSR(1'b0), .GTS(1'b0), .KEYCLEARB(1'b1), .PACK(1'b0),
+        .USRCCLKO(1'b0), .USRCCLKTS(1'b1), .USRDONEO(1'b1), .USRDONETS(1'b1));
+    BUFG sclk_buf (.I(cfgmclk), .O(sclk));
+
+    wire refclk;
+    IBUFDS_GTE2 refclk_ibuf (.I(refclk_p), .IB(refclk_n), .CEB(1'b0), .O(refclk), .ODIV2());
+
+    wire [7:0] txoutclk;
+    wire refclk_fab, clkfb, clk125, clk250, pll_locked;
+    reg  pll_rst = 1'b1;
+    BUFG txoutclk_buf (.I(txoutclk[0]), .O(refclk_fab));
+    PLLE2_BASE #(.CLKIN1_PERIOD(10.0), .CLKFBOUT_MULT(10), .DIVCLK_DIVIDE(1),
+                 .CLKOUT0_DIVIDE(8), .CLKOUT1_DIVIDE(4))
+        pipe_pll (.CLKIN1(refclk_fab), .CLKFBIN(clkfb), .CLKFBOUT(clkfb), .RST(pll_rst), .PWRDWN(1'b0),
+                  .CLKOUT0(clk125), .CLKOUT1(clk250), .CLKOUT2(), .CLKOUT3(), .CLKOUT4(), .CLKOUT5(),
+                  .LOCKED(pll_locked));
+    wire userclk;
+    BUFG pclk_buf (.I(clk125), .O(pclk));
+    BUFG uclk_buf (.I(clk250), .O(userclk));
+    reg oobclk = 1'b0;
+    always @(posedge refclk_fab) oobclk <= ~oobclk;
+
+    // ------------------------------------------------------------------ PIPE signals (block <-> lanes)
+    wire [127:0] pipe_tx_data;  wire [15:0] pipe_tx_charisk, pipe_tx_powerdown;
+    wire [7:0]   pipe_tx_elecidle, pipe_tx_compliance, pipe_rx_polarity;
+    wire         pipe_tx_deemph, pipe_tx_rate, pipe_tx_rcvrdet, pipe_tx_reset;
+    wire [2:0]   pipe_tx_margin;
+    wire [127:0] pipe_rx_data;  wire [15:0] pipe_rx_charisk;  wire [23:0] pipe_rx_status;
+    wire [7:0]   pipe_rx_valid, pipe_rx_chanisaligned, pipe_rx_phystatus, pipe_rx_elecidle;
+
+    // ------------------------------------------------------------------ transceivers
+    wire [7:0] cplllock, txresetdone, rxresetdone, txdlysresetdone, txphinitdone, txphaligndone;
+    wire [7:0] cpllrefclklost, rxbyteisaligned, gt_phystatus;
+    wire [4:0] chbond0;            // lane 0 (bonding master) -> all other lanes (star, as in the factory design)
+    reg  [7:0] txdlysreset = 0, txphinit = 0, txphalign = 0, txdlyen = 0;
+    reg        cpllpd = 1'b1, cpllreset = 1'b0, gtreset = 1'b1, userrdy = 1'b0;
+    reg        p_lpm = 1'b1, phy_gate = 1'b0;   // pclk domain
+    assign pipe_rx_phystatus = phy_gate ? gt_phystatus : 8'hff;   // PHY status stays high until the PHY is ready
+
+    genvar i;
+    generate for (i = 0; i < 8; i = i + 1) begin : lane
+        wire [63:0] rxd; wire [7:0] rxk; wire [4:0] cbo;
+        GTXE2_CHANNEL #(`GTXE2_CHANNEL_FACTORY_PARAMS) gtx (
+            // clocks and PLL
+            .GTREFCLK0(refclk), .GTREFCLK1(1'b0), .GTNORTHREFCLK0(1'b0), .GTNORTHREFCLK1(1'b0),
+            .GTSOUTHREFCLK0(1'b0), .GTSOUTHREFCLK1(1'b0), .GTGREFCLK(1'b0), .QPLLCLK(1'b0), .QPLLREFCLK(1'b0),
+            .CPLLREFCLKSEL(3'b001), .CPLLPD(cpllpd), .CPLLRESET(cpllreset), .CPLLLOCKEN(1'b1),
+            .CPLLLOCKDETCLK(1'b1), .CPLLLOCK(cplllock[i]), .CPLLREFCLKLOST(cpllrefclklost[i]), .CPLLFBCLKLOST(),
+            .TXSYSCLKSEL(2'b00), .RXSYSCLKSEL(2'b00),
+            .TXUSRCLK(pclk), .TXUSRCLK2(pclk), .RXUSRCLK(pclk), .RXUSRCLK2(pclk),
+            .TXOUTCLKSEL(i == 0 ? 3'b011 : 3'b000), .TXOUTCLK(txoutclk[i]), .TXOUTCLKFABRIC(), .TXOUTCLKPCS(),
+            .RXOUTCLKSEL(3'b000), .RXOUTCLK(), .RXOUTCLKFABRIC(), .RXOUTCLKPCS(),
+            .CLKRSVD({3'b000, oobclk}), .TXPHDLYTSTCLK(1'b1),
+            // serial pins
+            .GTXRXP(rxp[i]), .GTXRXN(rxn[i]), .GTXTXP(txp[i]), .GTXTXN(txn[i]),
+            // resets
+            .GTTXRESET(gtreset), .GTRXRESET(gtreset), .TXUSERRDY(userrdy), .RXUSERRDY(userrdy),
+            .GTRESETSEL(1'b0), .RESETOVRD(1'b0), .CFGRESET(1'b0),
+            .TXPCSRESET(1'b0), .TXPMARESET(1'b0), .RXPCSRESET(1'b0), .RXPMARESET(1'b0),
+            .RXBUFRESET(1'b0), .RXCDRRESET(1'b0), .RXCDRFREQRESET(1'b0), .RXCDRRESETRSV(1'b0),
+            .RXDFELPMRESET(1'b0), .RXOOBRESET(1'b0), .EYESCANRESET(1'b0), .RXPRBSCNTRESET(1'b0),
+            .TXRESETDONE(txresetdone[i]), .RXRESETDONE(rxresetdone[i]),
+            // TX phase alignment (TXBUF_EN = FALSE), multi-lane manual mode as in the factory design
+            .TXPHALIGNEN(1'b1), .TXDLYBYPASS(1'b0), .TXDLYSRESET(txdlysreset[i]),
+            .TXPHINIT(txphinit[i]), .TXPHALIGN(txphalign[i]), .TXDLYEN(txdlyen[i]),
+            .TXPHDLYRESET(1'b0), .TXDLYHOLD(1'b0), .TXDLYUPDOWN(1'b0), .TXDLYOVRDEN(1'b0), .TXPHOVRDEN(1'b0),
+            .TXPHDLYPD(1'b0), .TXDLYSRESETDONE(txdlysresetdone[i]), .TXPHINITDONE(txphinitdone[i]),
+            .TXPHALIGNDONE(txphaligndone[i]),
+            // RX buffer is used: RX phase alignment bypassed
+            .RXDLYBYPASS(1'b1), .RXPHALIGNEN(1'b0), .RXDLYSRESET(1'b0), .RXPHALIGN(1'b0), .RXDLYEN(1'b0),
+            .RXPHDLYRESET(1'b0), .RXDLYOVRDEN(1'b0), .RXPHOVRDEN(1'b0), .RXPHDLYPD(1'b0), .RXDDIEN(1'b0),
+            // TX data path <- PCIe block
+            .TXDATA({48'd0, pipe_tx_data[16*i +: 16]}), .TXCHARISK({6'd0, pipe_tx_charisk[2*i +: 2]}),
+            .TXCHARDISPMODE({7'd0, pipe_tx_compliance[i]}), .TXCHARDISPVAL(8'd0),
+            .TX8B10BEN(1'b1), .TX8B10BBYPASS(8'd0), .TXHEADER(3'd0), .TXSEQUENCE(7'd0),
+            .TXSTARTSEQ(1'b0), .TXPOLARITY(1'b0), .TXINHIBIT(1'b0), .TXPRBSSEL(3'd0), .TXPRBSFORCEERR(1'b0),
+            // TX driver: PIPE mode (TXDEEMPH/TXMARGIN/TXSWING; the cursors are unused at Gen1/2)
+            .TXELECIDLE(pipe_tx_elecidle[i]), .TXPD(pipe_tx_powerdown[2*i +: 2]), .TXDETECTRX(pipe_tx_rcvrdet),
+            .TXDEEMPH(pipe_tx_deemph), .TXMARGIN(pipe_tx_margin), .TXSWING(1'b0),
+            .TXDIFFCTRL(4'b1100), .TXBUFDIFFCTRL(3'b100), .TXMAINCURSOR(7'd0),
+            .TXPOSTCURSOR(5'd0), .TXPRECURSOR(5'd0), .TXPOSTCURSORINV(1'b0), .TXPRECURSORINV(1'b0),
+            .TXDIFFPD(1'b0), .TXPISOPD(1'b0), .TXPDELECIDLEMODE(1'b0),
+            .TXQPIBIASEN(1'b0), .TXQPISTRONGPDOWN(1'b0), .TXQPIWEAKPUP(1'b0),
+            .TXCOMINIT(1'b0), .TXCOMSAS(1'b0), .TXCOMWAKE(1'b0),
+            .TXRATE(3'b000), .TXRATEDONE(),     // Gen1 only: the rate never changes
+            // RX data path -> PCIe block
+            .RXDATA(rxd), .RXCHARISK(rxk), .RX8B10BEN(1'b1), .RXPOLARITY(pipe_rx_polarity[i]),
+            .RXPRBSSEL(3'd0), .RXPRBSERR(), .RXCOMMADETEN(1'b1), .RXMCOMMAALIGNEN(1'b1), .RXPCOMMAALIGNEN(1'b1),
+            .RXSLIDE(1'b0), .RXGEARBOXSLIP(1'b0), .RXBYTEISALIGNED(rxbyteisaligned[i]),
+            .RXCHBONDEN(1'b1), .RXCHBONDMASTER(i == 0), .RXCHBONDSLAVE(i != 0),
+            .RXCHBONDLEVEL(i == 0 ? 3'b001 : 3'b000), .RXCHBONDI(i == 0 ? 5'd0 : chbond0), .RXCHBONDO(cbo),
+            .RXCHANISALIGNED(pipe_rx_chanisaligned[i]), .RXVALID(pipe_rx_valid[i]),
+            .RXSTATUS(pipe_rx_status[3*i +: 3]), .PHYSTATUS(gt_phystatus[i]), .RXELECIDLE(pipe_rx_elecidle[i]),
+            .RXELECIDLEMODE(2'b00), .RXPD(pipe_tx_powerdown[2*i +: 2]), .RXRATE(3'b000), .RXRATEDONE(),
+            .LOOPBACK(3'b000), .SETERRSTATUS(1'b0), .RXQPIEN(1'b0),
+            // RX equaliser: LPM, DFE overrides as in the factory design
+            .RXLPMEN(p_lpm), .RXDFELFOVRDEN(1'b1), .RXDFEAGCHOLD(1'b0), .RXDFEAGCOVRDEN(1'b0),
+            .RXDFECM1EN(1'b0), .RXDFELFHOLD(1'b0), .RXDFETAP2HOLD(1'b0), .RXDFETAP2OVRDEN(1'b0),
+            .RXDFETAP3HOLD(1'b0), .RXDFETAP3OVRDEN(1'b0), .RXDFETAP4HOLD(1'b0), .RXDFETAP4OVRDEN(1'b0),
+            .RXDFETAP5HOLD(1'b0), .RXDFETAP5OVRDEN(1'b0), .RXDFEUTHOLD(1'b0), .RXDFEUTOVRDEN(1'b0),
+            .RXDFEVPHOLD(1'b0), .RXDFEVPOVRDEN(1'b0), .RXDFEVSEN(1'b0), .RXDFEXYDEN(1'b0),
+            .RXDFEXYDHOLD(1'b0), .RXDFEXYDOVRDEN(1'b0), .RXLPMHFHOLD(1'b0), .RXLPMHFOVRDEN(1'b0),
+            .RXLPMLFHOLD(1'b0), .RXLPMLFKLOVRDEN(1'b0), .RXOSHOLD(1'b0), .RXOSOVRDEN(1'b0),
+            .RXCDRHOLD(1'b0), .RXCDROVRDEN(1'b0), .RXMONITORSEL(2'b00),
+            // eye scan, DRP, reserved
+            .EYESCANMODE(1'b0), .EYESCANTRIGGER(1'b0),
+            .DRPCLK(pclk), .DRPEN(1'b0), .DRPWE(1'b0), .DRPADDR(9'd0), .DRPDI(16'd0), .DRPDO(), .DRPRDY(),
+            .GTRSVD(16'd0), .PCSRSVDIN(16'd0), .PCSRSVDIN2(5'd0), .PMARSVDIN(5'd0), .PMARSVDIN2(5'd0),
+            .TSTIN(20'hfffff)
+        );
+        assign pipe_rx_data[16*i +: 16] = rxd[15:0];
+        assign pipe_rx_charisk[2*i +: 2] = rxk[1:0];
+        if (i == 0) begin : master
+            assign chbond0 = cbo;
+        end
+    end endgenerate
+
+    // QPLL blocks of both quads: powered down (the lanes use their CPLLs), band gap and RCAL on.
+    // Quad 115 gets the reference clock from quad 116; nextpnr cannot express that, ../fasm_patch.py adds the bits.
+    (* keep, BEL = "GTXE2_COMMON_X0Y5/GTXE2_COMMON" *) GTXE2_COMMON #(`GTXE2_COMMON_FACTORY_PARAMS) qpll116 (
+        .GTREFCLK0(refclk), .GTREFCLK1(1'b0), .GTNORTHREFCLK0(1'b0), .GTNORTHREFCLK1(1'b0),
+        .GTSOUTHREFCLK0(1'b0), .GTSOUTHREFCLK1(1'b0), .GTGREFCLK(1'b0),
+        .QPLLPD(1'b1), .QPLLRESET(1'b1), .QPLLLOCKEN(1'b1), .QPLLLOCKDETCLK(1'b1), .QPLLREFCLKSEL(3'b001),
+        .QPLLOUTRESET(1'b0), .BGBYPASSB(1'b1), .BGMONITORENB(1'b1), .BGPDB(1'b1), .BGRCALOVRD(5'b11111),
+        .RCALENB(1'b1), .PMARSVD(8'd0), .QPLLRSVD1(16'd0), .QPLLRSVD2(5'b11111),
+        .DRPCLK(pclk), .DRPEN(1'b0), .DRPWE(1'b0), .DRPADDR(8'd0), .DRPDI(16'd0));
+    (* keep, BEL = "GTXE2_COMMON_X0Y4/GTXE2_COMMON" *) GTXE2_COMMON #(`GTXE2_COMMON_FACTORY_PARAMS) qpll115 (
+        .GTREFCLK0(1'b0), .GTREFCLK1(1'b0), .GTNORTHREFCLK0(1'b0), .GTNORTHREFCLK1(1'b0),
+        .GTSOUTHREFCLK0(1'b0), .GTSOUTHREFCLK1(1'b0), .GTGREFCLK(1'b0),
+        .QPLLPD(1'b1), .QPLLRESET(1'b1), .QPLLLOCKEN(1'b1), .QPLLLOCKDETCLK(1'b1), .QPLLREFCLKSEL(3'b010),
+        .QPLLOUTRESET(1'b0), .BGBYPASSB(1'b1), .BGMONITORENB(1'b1), .BGPDB(1'b1), .BGRCALOVRD(5'b11111),
+        .RCALENB(1'b1), .PMARSVD(8'd0), .QPLLRSVD1(16'd0), .QPLLRSVD2(5'b11111),
+        .DRPCLK(pclk), .DRPEN(1'b0), .DRPWE(1'b0), .DRPADDR(8'd0), .DRPDI(16'd0));
+
+
+    // ------------------------------------------------------------------ sclk: reset sequencer
+    // Starts on PERST# high (and on a JTAG restart), runs the stage-1 sequence, then releases the PCIe block
+    // (if enabled). PERST# low at any time = back to the start, block held in reset.
+    localparam S_START = 0, S_PDREL = 1, S_CPLLRST = 2, S_LOCK = 3, S_GTRST = 4, S_SYNC = 5, S_SYNCW = 6,
+               S_READY = 7, S_ERROR = 15;
+    reg  [3:0]  st = S_START, err_st = 0;
+    reg  [21:0] tmr = 0;
+    reg  [31:0] ready_time = 0, run_time = 0;
+    reg  [15:0] restarts = 0, perst_falls = 0;
+    reg         sync_req = 1'b0, core_rst_n = 1'b0, perst_q = 1'b0;
+    reg  [2:0]  restart_s = 0;
+    wire [7:0]  cplllock_s, txrd_s, rxrd_s;
+    wire        pll_locked_s, sync_ack_s, perst_s;
+    reg         sync_ack = 1'b0;   // pclk domain, below
+    sync2 #(8) s_cl (sclk, cplllock, cplllock_s);
+    sync2 #(8) s_tr (sclk, txresetdone, txrd_s);
+    sync2 #(8) s_rr (sclk, rxresetdone, rxrd_s);
+    sync2 #(1) s_pl (sclk, pll_locked, pll_locked_s);
+    sync2 #(1) s_sa (sclk, sync_ack, sync_ack_s);
+    sync2 #(1) s_pe (sclk, perst_n, perst_s);
+    
+    wire all_lock = &cplllock_s && pll_locked_s, all_rd = &txrd_s && &rxrd_s;
+    always @(posedge sclk) begin
+        restart_s <= {restart_s[1:0], restart_t};
+        perst_q   <= perst_s;
+        tmr       <= tmr + 1'b1;
+        run_time  <= run_time + 1'b1;
+        core_rst_n <= (st == S_READY) && 1'b1 && perst_s;
+        case (st)
+        S_START:   begin cpllpd <= 1; cpllreset <= 0; gtreset <= 1; userrdy <= 0; pll_rst <= 1;
+                         if (!perst_s) tmr <= 0;
+                         else if (tmr[16]) begin st <= S_PDREL; tmr <= 0; end end              // ~1 ms
+        S_PDREL:   begin cpllpd <= 0;   if (tmr[10]) begin st <= S_CPLLRST; tmr <= 0; end end
+        S_CPLLRST: begin cpllreset <= 1; if (tmr[8]) begin st <= S_LOCK; tmr <= 0; end end
+        S_LOCK:    begin cpllreset <= 0; pll_rst <= 0;
+                         if (all_lock && tmr[10]) begin st <= S_GTRST; tmr <= 0; end
+                         else if (tmr[21]) begin err_st <= st; st <= S_ERROR; end end      // ~33 ms
+        S_GTRST:   begin gtreset <= 0; userrdy <= 1;
+                         if (all_rd) begin st <= S_SYNC; tmr <= 0; end
+                         else if (tmr[21]) begin err_st <= st; st <= S_ERROR; end end
+        S_SYNC:    begin sync_req <= ~sync_req; st <= S_SYNCW; tmr <= 0; end
+        S_SYNCW:   if (sync_ack_s == sync_req) begin st <= S_READY; ready_time <= run_time; end
+                   else if (tmr[21]) begin err_st <= st; st <= S_ERROR; end
+        default:   ;
+        endcase
+        if (perst_q && !perst_s) perst_falls <= perst_falls + 1'b1;
+        if ((restart_s[2] != restart_s[1]) || (!perst_s && st != S_START)) begin
+            st <= S_START; tmr <= 0; err_st <= 0; run_time <= 0; ready_time <= 0; core_rst_n <= 0;
+            if (restart_s[2] != restart_s[1]) restarts <= restarts + 1'b1;
+        end
+    end
+
+    // ------------------------------------------------------------------ pclk: block reset, TX phase alignment
+    reg  [1:0] rst_ps = 0;
+    reg        pcie_rst_n = 1'b0;    // SYSRSTN, one pclk after the PHY status opens
+    reg  [1:0] lpm_ps = 2'b11;
+    always @(posedge pclk) begin
+        rst_ps <= {rst_ps[0], core_rst_n};
+        phy_gate <= rst_ps[1];
+        pcie_rst_n <= phy_gate;
+        lpm_ps <= 2'b11;          // RX equaliser: LPM (as stage 2)
+        p_lpm <= lpm_ps[1];
+    end
+
+    // TX phase alignment (UG476 TX buffer bypass), multi-lane manual mode with lane 0 as master (stage 1).
+    localparam T_IDLE = 0, T_DLYSRST = 1, T_MINIT = 2, T_MALIGN = 3, T_MDLYEN = 4, T_SINIT = 5, T_SALIGN = 6,
+               T_MDLYEN2 = 7, T_DONE = 8, T_ERR = 15;
+    reg  [3:0] ts = T_IDLE, ts_err = 0;
+    reg  [7:0] seen = 0;
+    reg        req_cur = 1'b0;
+    reg  [16:0] ttmr = 0;
+    wire [7:0] dlysrd_s, phinitd_s, phalignd_s;
+    reg  [7:0] phinitd_r = 0, phalignd_r = 0, init_rise = 0, align_rise = 0;
+    wire       sreq_d;
+    sync2 #(8) s_dr (pclk, txdlysresetdone, dlysrd_s);
+    sync2 #(8) s_pi (pclk, txphinitdone, phinitd_s);
+    sync2 #(8) s_pa (pclk, txphaligndone, phalignd_s);
+    sync2 #(1) s_sq (pclk, sync_req, sreq_d);
+    always @(posedge pclk) begin
+        phinitd_r <= phinitd_s; phalignd_r <= phalignd_s;
+        init_rise <= phinitd_s & ~phinitd_r; align_rise <= phalignd_s & ~phalignd_r;
+        ttmr <= ttmr + 1'b1;
+        case (ts)   // per-lane steps: a lane's request drops once its done is seen; next state when all are seen
+        T_IDLE, T_DONE, T_ERR: ;
+        T_DLYSRST: begin
+            seen <= seen | dlysrd_s; txdlysreset <= ~(seen | dlysrd_s);
+            if (&seen) begin txdlysreset <= 0; seen <= 0; ttmr <= 0; ts <= T_MINIT; end
+        end
+        T_MINIT:   begin txphinit[0] <= 1;
+                         if (init_rise[0]) begin txphinit[0] <= 0; ts <= T_MALIGN; ttmr <= 0; end end
+        T_MALIGN:  begin txphalign[0] <= 1;
+                         if (align_rise[0]) begin txphalign[0] <= 0; ts <= T_MDLYEN; ttmr <= 0; end end
+        T_MDLYEN:  begin txdlyen[0] <= 1;
+                         if (align_rise[0]) begin txdlyen[0] <= 0; ts <= T_SINIT; seen <= 8'h01; ttmr <= 0; end end
+        T_SINIT:   begin seen <= seen | init_rise; txphinit <= ~(seen | init_rise);
+                         if (&seen) begin txphinit <= 0; seen <= 8'h01; ts <= T_SALIGN; ttmr <= 0; end end
+        T_SALIGN:  begin seen <= seen | align_rise; txphalign <= ~(seen | align_rise);
+                         if (&seen) begin txphalign <= 0; ts <= T_MDLYEN2; ttmr <= 0; end end
+        T_MDLYEN2: begin txdlyen[0] <= 1;
+                         if (align_rise[0]) begin txdlyen[0] <= 0; ts <= T_DONE; end end
+        default: ts <= T_ERR;
+        endcase
+        if (ts != T_IDLE && ts != T_DONE && ts != T_ERR && ttmr[16]) begin   // ~1 ms
+            ts_err <= ts; ts <= T_ERR; txdlysreset <= 0; txphinit <= 0; txphalign <= 0; txdlyen <= 0;
+        end
+        if (ts == T_DONE || ts == T_ERR) sync_ack <= req_cur;
+        if (sreq_d != req_cur) begin   // new request (from the sequencer)
+            req_cur <= sreq_d; ts <= T_DLYSRST; seen <= 0; ttmr <= 0; ts_err <= 0;
+            txdlysreset <= 0; txphinit <= 0; txphalign <= 0; txdlyen <= 0;
+        end
+    end
+
+    // ------------------------------------------------------------------ PCIe hard block
+    wire [5:0]   pl_ltssm;   wire [1:0] pl_sel_width, pl_lane_rev, pl_rx_pm, cfg_cur_speed, cfg_pm_state;
+    wire [2:0]   pl_init_width, pl_tx_pm, cfg_link_state;
+    wire [3:0]   cfg_neg_width;
+    wire         pl_phy_lnk_up_n, pl_sel_rate, pl_hot_rst;
+    wire         trn_lnk_up, cfg_mem_en, cfg_bm_en;
+    wire         trn_tcfg_req;
+    wire [3:0]   trn_tdst_rdy4;
+    wire [68:0]  mim_tx_wdata, mim_tx_rdata;  wire [12:0] mim_tx_waddr, mim_tx_raddr;  wire mim_tx_wen, mim_tx_ren;
+    wire [67:0]  mim_rx_wdata, mim_rx_rdata;  wire [12:0] mim_rx_waddr, mim_rx_raddr;  wire mim_rx_wen, mim_rx_ren;
+    wire         ll2_badtlp, ll2_baddllp, ll2_receiver, ll2_replayro, ll2_replayto;
+    wire         pl2_receiver, pl2_recovery, tl2_malformed;
+`include "pcie_x8_inst.vh"
+    assign trn_tdst_rdy = trn_tdst_rdy4[0];
+    assign lnk_up = trn_lnk_up;
+    assign ltssm = pl_ltssm;
+    assign neg_width = cfg_neg_width;
+    assign cur_speed = cfg_cur_speed;
+    assign bm_en = cfg_bm_en;
+    assign mem_en = cfg_mem_en;
+    assign seq_st = st;
+    assign seq_err = err_st;
+    assign tx_al_st = ts;
+    assign tx_al_err = ts_err;
+
+    // error / debug event counters (cycles high at userclk, 16-bit saturating)
+    wire [7:0] ev = {pl2_recovery, tl2_malformed, pl2_receiver, ll2_receiver, ll2_replayto, ll2_replayro,
+                     ll2_baddllp, ll2_badtlp};
+    reg  [7:0]   ev_q = 0;
+    reg  [127:0] n_ev = 0;
+    integer e;
+    always @(posedge userclk) begin
+        ev_q <= ev;
+        for (e = 0; e < 8; e = e + 1)
+            if (ev_q[e] && n_ev[16*e +: 16] != 16'hffff) n_ev[16*e +: 16] <= n_ev[16*e +: 16] + 1'b1;
+    end
+    assign ev_count = n_ev;
+
+
+    // TX and RX buffers of the block, as Xilinx's pcie_bram_top_7x builds them for these parameters:
+    // 2 x RAMB36 of 1024 x 36 each (TX: 29 packets x (256 + 24) bytes = 8120 bytes; RX: VC0_RX_RAM_LIMIT 0x3ff),
+    // read latency 2 (TL_*_RAM_RDATA_LATENCY 2 = output register on), no write/address pipeline (latency 0).
+    // Placed where the factory design has them (BRAM_L_X108 rows 200/205 = TX, 215/220 = RX, next to the MIM pins),
+    // with the factory's port use: write on B, read on A through the output register.
+    wire [71:0] mim_tx_rd72, mim_rx_rd72;
+`define MIM_RAM(name, loc, wen, waddr, wdata, ren, raddr, rdata) \
+    (* BEL = loc *) RAMB36E1 #(.RAM_MODE("TDP"), .READ_WIDTH_A(36), .WRITE_WIDTH_A(36), .READ_WIDTH_B(36), \
+        .WRITE_WIDTH_B(36), .DOA_REG(1), .DOB_REG(0), .WRITE_MODE_A("NO_CHANGE"), .WRITE_MODE_B("NO_CHANGE")) \
+    name (.CLKARDCLK(userclk), .CLKBWRCLK(userclk), .ENARDEN(ren), .ENBWREN(wen), .REGCEAREGCE(1'b1), .REGCEB(1'b0), \
+        .RSTRAMARSTRAM(1'b0), .RSTRAMB(1'b0), .RSTREGARSTREG(1'b0), .RSTREGB(1'b0), .WEA(4'd0), .WEBWE({4'd0, {4{wen}}}), \
+        .ADDRARDADDR({1'b1, raddr, 5'd0}), .ADDRBWRADDR({1'b1, waddr, 5'd0}), \
+        .DIADI(32'd0), .DIPADIP(4'd0), .DIBDI(wdata[31:0]), .DIPBDIP(wdata[35:32]), \
+        .DOADO(rdata[31:0]), .DOPADOP(rdata[35:32]), .DOBDO(), .DOPBDOP(), \
+        .CASCADEINA(1'b0), .CASCADEINB(1'b0), .INJECTDBITERR(1'b0), .INJECTSBITERR(1'b0));
+    // (the macro indexes its data arguments, so they must be plain 36-bit wires)
+    wire [35:0] tx_wd0 = mim_tx_wdata[35:0], tx_wd1 = {3'd0, mim_tx_wdata[68:36]};
+    wire [35:0] rx_wd0 = mim_rx_wdata[35:0], rx_wd1 = {4'd0, mim_rx_wdata[67:36]};
+    wire [35:0] tx_rd0, tx_rd1, rx_rd0, rx_rd1;
+    wire [9:0]  tx_wa = mim_tx_waddr[9:0], tx_ra = mim_tx_raddr[9:0], rx_wa = mim_rx_waddr[9:0], rx_ra = mim_rx_raddr[9:0];
+    `MIM_RAM(tx_ram0, "RAMB36_X10Y40/RAMB36E1", mim_tx_wen, tx_wa, tx_wd0, mim_tx_ren, tx_ra, tx_rd0)
+    `MIM_RAM(tx_ram1, "RAMB36_X10Y41/RAMB36E1", mim_tx_wen, tx_wa, tx_wd1, mim_tx_ren, tx_ra, tx_rd1)
+    `MIM_RAM(rx_ram0, "RAMB36_X10Y43/RAMB36E1", mim_rx_wen, rx_wa, rx_wd0, mim_rx_ren, rx_ra, rx_rd0)
+    `MIM_RAM(rx_ram1, "RAMB36_X10Y44/RAMB36E1", mim_rx_wen, rx_wa, rx_wd1, mim_rx_ren, rx_ra, rx_rd1)
+    assign mim_tx_rd72 = {tx_rd1, tx_rd0};
+    assign mim_rx_rd72 = {rx_rd1, rx_rd0};
+    assign mim_tx_rdata = mim_tx_rd72[68:0];
+    assign mim_rx_rdata = mim_rx_rd72[67:0];
+endmodule
+
+`ifndef PCIE_SYNC2
+`define PCIE_SYNC2
+// two-flop synchroniser
+module sync2 #(parameter W = 1) (input wire clk, input wire [W-1:0] d, output reg [W-1:0] q);
+    reg [W-1:0] m = 0;
+    initial q = 0;
+    always @(posedge clk) begin m <= d; q <= m; end
+endmodule
+`endif

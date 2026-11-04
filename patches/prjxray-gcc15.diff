@@ -1,0 +1,25 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9e1ad2c..e8347d2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,7 +36,7 @@ target_include_directories(yaml-cpp PUBLIC
+ 	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/yaml-cpp/include>
+ 	)
+ 
+-add_compile_options(-Wall -Werror)
++add_compile_options(-Wall)
+ 
+ add_subdirectory(lib)
+ add_subdirectory(tools)
+diff --git a/lib/include/prjxray/memory_mapped_file.h b/lib/include/prjxray/memory_mapped_file.h
+index 6aeb821..b6c5064 100644
+--- a/lib/include/prjxray/memory_mapped_file.h
++++ b/lib/include/prjxray/memory_mapped_file.h
+@@ -13,6 +13,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include <cstdint>
+ #include <absl/types/span.h>
+ 
+ namespace prjxray {

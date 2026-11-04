@@ -1,0 +1,13 @@
+diff --git a/src/xilinx.cpp b/src/xilinx.cpp
+index 276531c..5b4a9af 100644
+--- a/src/xilinx.cpp
++++ b/src/xilinx.cpp
+@@ -475,7 +475,7 @@ Xilinx::Xilinx(Jtag *jtag, const std::string &filename,
+ 	}
+ 
+ 	if (read_xadc) {
+-		if (_fpga_family == ARTIX_FAMILY || _fpga_family == KINTEXUS_FAMILY) {
++		if (_fpga_family == ARTIX_FAMILY || _fpga_family == KINTEX_FAMILY || _fpga_family == KINTEXUS_FAMILY) {
+ 			// calibrate XADC
+ 			Xilinx::xadc_single(8);
+ 

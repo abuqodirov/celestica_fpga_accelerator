@@ -1,0 +1,244 @@
+diff --git a/xilinx/arch.cc b/xilinx/arch.cc
+index 3090d52..47f72f1 100644
+--- a/xilinx/arch.cc
++++ b/xilinx/arch.cc
+@@ -22,6 +22,7 @@
+ #include <boost/algorithm/string.hpp>
+ #include <boost/range/adaptor/reversed.hpp>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <queue>
+@@ -2293,6 +2294,30 @@ bool Arch::route()
+     // Runs after fixupRouting() so a pass-through pip fixupRouting() decides to
+     // un-pip doesn't get its CE needlessly tied to VCC on an unused BUFHCE.
+     routeBufhcePassthroughCE();
++    // celestica PCIe debug: NPNR_HARD_TIMING_DUMP=<file> writes the routed delay (ns) of every arc between a
++    // PCIE_2_1 cell and a block RAM (MIM buffer paths), one line per arc.
++    if (const char *dump = getenv("NPNR_HARD_TIMING_DUMP")) {
++        std::ofstream f(dump);
++        auto is_ram = [&](const CellInfo *c) {
++            return c->type == id("RAMB36E1_RAMB36E1") || c->type == id("RAMB18E1_RAMB18E1");
++        };
++        auto is_pcie = [&](const CellInfo *c) { return c->type == id("PCIE_2_1_PCIE_2_1"); };
++        for (auto &n : getCtx()->nets) {
++            NetInfo *ni = n.second.get();
++            if (ni->driver.cell == nullptr)
++                continue;
++            for (auto &u : ni->users) {
++                if (u.cell == nullptr)
++                    continue;
++                bool clk_arc = (is_pcie(u.cell) || is_ram(u.cell)) && u.port.str(this).find("CLK") != std::string::npos;
++                if (!clk_arc && !((is_pcie(ni->driver.cell) && is_ram(u.cell)) || (is_ram(ni->driver.cell) && is_pcie(u.cell))))
++                    continue;
++                f << getDelayNS(getCtx()->getNetinfoRouteDelay(ni, u)) << " " << ni->name.str(this) << " "
++                  << ni->driver.cell->name.str(this) << "." << ni->driver.port.str(this) << " -> "
++                  << u.cell->name.str(this) << "." << u.port.str(this) << "\n";
++            }
++        }
++    }
+     // router1 runs its own final timing analysis; the router2 flow
+     // historically ended without one, so the last "Max frequency" lines the
+     // user saw were the placer's pre-route ESTIMATES (printed mid-flow by
+@@ -2585,8 +2610,101 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
+     return false;
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------
++// Optional timing for hard-block <-> block RAM paths (celestica PCIe, 2026-11-02). Enabled only when the
++// environment variable NPNR_HARD_TIMING is set (other designs built with this binary are unchanged).
++// Without it PCIE_2_1 and RAMB18/36 pins are TMG_IGNORE: the 250 MHz paths between the PCIe block and its
++// TX/RX buffer RAMs (MIM*) are neither reported nor optimised by the router.
++//   PCIE_2_1: MIM{TX,RX}{WADDR,WDATA,WEN,RADDR,REN} = register outputs, MIM{TX,RX}RDATA = register inputs,
++//             clock USERCLK. Clock-to-out / setup are ASSUMED (no public per-pin numbers): 1.0 / 0.5 ns.
++//   RAMB36E1/RAMB18E1: port A pins on CLKARDCLK, port B pins on CLKBWRCLK (SDP: all DI on the write clock,
++//             all DO on the read clock). DS182-like -2 values: clock-to-out 0.65 ns (DO_REG) / 1.8 ns,
++//             setup 0.55 ns.
++static bool npnr_hard_timing()
++{
++    static int en = -1;
++    if (en < 0) {
++        const char *e = getenv("NPNR_HARD_TIMING");
++        en = (e != nullptr && *e != '\0' && *e != '0') ? 1 : 0;
++    }
++    return en == 1;
++}
++
++static bool str_starts(const std::string &s, const char *p) { return s.rfind(p, 0) == 0; }
++
++// 0 = not timed, 1 = register input, 2 = register output, 3 = clock input.
++// clk = clock port name, c2q / setup in ns.
++static int hard_port_timing(const Context *ctx, const CellInfo *cell, IdString port, IdString &clk, double &c2q,
++                            double &setup)
++{
++    if (!npnr_hard_timing())
++        return 0;
++    const std::string t = cell->type.str(ctx), p = port.str(ctx);
++    if (t == "PCIE_2_1_PCIE_2_1") {
++        clk = ctx->id("USERCLK");
++        c2q = 1.0;
++        setup = 0.5;
++        if (p == "USERCLK")
++            return 3;
++        if (str_starts(p, "MIMRXRDATA") || str_starts(p, "MIMTXRDATA"))
++            return 1;
++        if (str_starts(p, "MIMRXW") || str_starts(p, "MIMTXW") || str_starts(p, "MIMRXRADDR") ||
++            str_starts(p, "MIMTXRADDR") || p == "MIMRXREN" || p == "MIMTXREN")
++            return 2;
++        return 0;
++    }
++    bool is36 = (t == "RAMB36E1_RAMB36E1"), is18 = (t == "RAMB18E1_RAMB18E1");
++    if (!is36 && !is18)
++        return 0;
++    IdString clka = ctx->id(is36 ? "CLKARDCLKL" : "CLKARDCLK"), clkb = ctx->id(is36 ? "CLKBWRCLKL" : "CLKBWRCLK");
++    if (str_starts(p, "CLKARDCLK") || str_starts(p, "CLKBWRCLK"))
++        return 3;
++    auto mode = cell->params.find(ctx->id("RAM_MODE"));
++    bool sdp = mode != cell->params.end() && mode->second.is_string && mode->second.as_string() == "SDP";
++    setup = 0.55;
++    if (str_starts(p, "DOADO") || str_starts(p, "DOPADOP") || str_starts(p, "DOBDO") || str_starts(p, "DOPBDOP")) {
++        bool a = sdp || str_starts(p, "DOADO") || str_starts(p, "DOPADOP");
++        clk = a ? clka : clkb;
++        bool reg = int_or_default(cell->params, ctx->id(a ? "DOA_REG" : "DOB_REG"), 0) != 0;
++        c2q = reg ? 0.65 : 1.8;
++        return 2;
++    }
++    static const char *pa[] = {"ADDRARDADDR", "ENARDEN", "WEA", "REGCEAREGCE", "RSTRAMARSTRAM", "RSTREGARSTREG",
++                               "DIADI", "DIPADIP"};
++    static const char *pb[] = {"ADDRBWRADDR", "ENBWREN", "WEBWE", "REGCEB", "RSTRAMB", "RSTREGB", "DIBDI",
++                               "DIPBDIP"};
++    for (auto x : pa)
++        if (str_starts(p, x)) {
++            bool di = str_starts(p, "DIADI") || str_starts(p, "DIPADIP");
++            clk = (sdp && di) ? clkb : clka;
++            c2q = 0;
++            return 1;
++        }
++    for (auto x : pb)
++        if (str_starts(p, x)) {
++            clk = clkb;
++            c2q = 0;
++            return 1;
++        }
++    return 0;
++}
++
+ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const
+ {
++    {
++        IdString clk;
++        double c2q = 0, setup = 0;
++        int k = hard_port_timing(getCtx(), cell, port, clk, c2q, setup);
++        if (k == 3)
++            return TMG_CLOCK_INPUT;
++        if (k == 1 || k == 2) {
++            auto cp = cell->ports.find(clk);
++            if (cp == cell->ports.end() || cp->second.net == nullptr)
++                return TMG_IGNORE;
++            clockInfoCount = 1;
++            return k == 1 ? TMG_REGISTER_INPUT : TMG_REGISTER_OUTPUT;
++        }
++    }
+     if (cell->type == id_SLICE_LUTX) {
+         if (get_net_or_empty(cell, id_O5) == nullptr && get_net_or_empty(cell, id_O6) == nullptr)
+             return TMG_IGNORE;
+@@ -2641,6 +2759,19 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
+ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
+ {
+     TimingClockingInfo info;
++    {
++        IdString clk;
++        double c2q = 0, setup = 0;
++        int k = hard_port_timing(getCtx(), cell, port, clk, c2q, setup);
++        if (k == 1 || k == 2) {
++            info.setup = getDelayFromNS(setup);
++            info.hold = getDelayFromNS(0);
++            info.clockToQ = getDelayFromNS(c2q);
++            info.clock_port = clk;
++            info.edge = RISING_EDGE;
++            return info;
++        }
++    }
+     info.setup = getDelayFromNS(0.1);
+     info.hold = getDelayFromNS(0.1);
+     info.clockToQ = getDelayFromNS(0.1);
+diff --git a/xilinx/fasm.cc b/xilinx/fasm.cc
+index bb007db..f52790a 100644
+--- a/xilinx/fasm.cc
++++ b/xilinx/fasm.cc
+@@ -2349,8 +2349,13 @@ struct FasmBackend
+         // RAMB18E1 it carries half of a 36-bit SDP read.
+         const bool b_side_reads_half_the_word =
+                 (is_36 ? (read_width_a == 72) : (read_width_a == 36));
+-        // On a RAMB18E1 the A side carries half of a 36-bit SDP write.
+-        const bool a_side_writes_half_the_word = (!is_36 && (write_width_b == 36));
++        // On a RAMB36E1 the A side carries half (DIADI/DIPADIP) of a 72-bit SDP
++        // write; on a RAMB18E1 it carries half of a 36-bit SDP write.  Without
++        // WRITE_WIDTH_A_18 the A-side write path stays narrow and the lower 36
++        // bits of every 72-bit write are stored as a replicated DI[1:0]
++        // (celestica JTAG loader FIFO: addresses/data low bits corrupted).
++        const bool a_side_writes_half_the_word =
++                (is_36 ? (write_width_b == 72) : (write_width_b == 36));
+ 
+         if (this_width_param_is_unset && this_param_is_read_width_b && b_side_reads_half_the_word) {
+             write_bit("READ_WIDTH_B_18");
+diff --git a/xilinx/pack.cc b/xilinx/pack.cc
+index 329d5b0..71610b8 100644
+--- a/xilinx/pack.cc
++++ b/xilinx/pack.cc
+@@ -1281,6 +1281,37 @@ void XC7Packer::pack_bram()
+ 
+     generic_xform(bram_rules, false);
+ 
++    // Output registers (DOA_REG / DOB_REG = 1) are clocked through their own SITE pins REGCLKARDRCLK / REGCLKB
++    // (RAMB36: L and U halves), not through CLKARDCLK / CLKBWRCLK. Vivado ties them to the data clock of the
++    // same port. Left unconnected (as before this fix) the register never loads and every read returns its
++    // init value - the PCIe block's MIM buffer RAMs (TL_*_RAM_RDATA_LATENCY 2) read back all zeros
++    // (celestica PCIe stage 2, 2026-11-02).
++    for (auto cell : sorted(ctx->cells)) {
++        CellInfo *ci = cell.second;
++        bool is36 = ci->type == id_RAMB36E1_RAMB36E1;
++        if (!is36 && ci->type != id_RAMB18E1_RAMB18E1)
++            continue;
++        for (char ab : {'A', 'B'}) {
++            if (!bool_or_default(ci->params, ctx->id(std::string("DO") + ab + "_REG"), false))
++                continue;
++            std::string clk = (ab == 'A') ? "CLKARDCLK" : "CLKBWRCLK";
++            std::string reg = (ab == 'A') ? "REGCLKARDRCLK" : "REGCLKB";
++            NetInfo *cn = get_net_or_empty(ci, ctx->id(is36 ? clk + "L" : clk));
++            if (cn == nullptr)
++                continue;
++            for (std::string sfx : (is36 ? std::vector<std::string>{"L", "U"} : std::vector<std::string>{""})) {
++                IdString p = ctx->id(reg + sfx);
++                if (!ci->ports.count(p)) {
++                    ci->ports[p].name = p;
++                    ci->ports[p].type = PORT_IN;
++                } else {
++                    disconnect_port(ctx, ci, p);
++                }
++                connect_port(ctx, cn, ci, p);
++            }
++        }
++    }
++
+     // These pins have no logical mapping, so must be tied after transformation
+     for (auto cell : sorted(ctx->cells)) {
+         CellInfo *ci = cell.second;
+diff --git a/xilinx/pack_gt_xc7.cc b/xilinx/pack_gt_xc7.cc
+index 042bba0..2e3f1c7 100644
+--- a/xilinx/pack_gt_xc7.cc
++++ b/xilinx/pack_gt_xc7.cc
+@@ -327,7 +327,11 @@ void XC7Packer::pack_gt()
+                                            boost::contains(port_name, "REFCLK") ||
+                                            boost::starts_with(port_name, "QPLL")) &&
+                                            !boost::contains(port_name, "CLKMONITOR") &&
+-                                           !boost::contains(port_name, "CLKLOST")) {
++                                           !boost::contains(port_name, "CLKLOST") &&
++                                           // CPLLREFCLKSEL is an ordinary fabric input (a mux select, not a
++                                           // clock): disconnecting it leaves the pins unrouted, which the
++                                           // silicon reads as 3'b111 = GTGREFCLK (celestica, 2026-10-31).
++                                           !boost::contains(port_name, "REFCLKSEL")) {
+                         if (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET")) {
+                             disconnect_port(ctx, ci, port.first);
+                             continue;

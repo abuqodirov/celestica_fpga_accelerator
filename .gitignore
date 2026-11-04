@@ -1,0 +1,44 @@
+# build outputs (LiteX, nextpnr, prjxray)
+build*/
+gateware/
+software/
+seeds/
+phases/
+*.bit
+*.frames
+*.fasm
+*.rpt
+*.log
+*.vcd
+*.fst
+obj_*/
+tests/**/top.json
+calc/tests/**/top.json
+pcie/probe.json
+*pinmap*.txt
+
+# model downloads and exported weights (see docs/llm-accelerator.md)
+mustaqi/hf/
+mustaqi/out/
+neuronlm/hf/
+neuronlm/out/
+neuronlm/out_*/
+
+# compiled helpers
+*.so
+mustaqi/c/mustaqi
+__pycache__/
+*.pyc
+
+# prjxray-db overlay created by pcie/db/make_overlay.sh (symlinks)
+pcie/db/kintex7_llm/
+
+# PCIe/transceiver settings read from the factory design: generated locally by pcie/make_params.sh, never published
+pcie/factory_params.vh
+pcie/s2/s2_params.vh
+pcie/core/pcie_x8_params.vh
+
+# never commit flash dumps or readbacks of the factory design
+*.bin
+*.xz
+factory*.bit

@@ -1,0 +1,22 @@
+# eval_uz.txt (238 tokens), bf16 ppl 8.757; q4 g32 plain: ppl 10.432 KL 0.0623 top1 87.4%
+q8   : perplexity    8.757 over 238 tokens (65 s)
+q8 group 32 vs bf16: mean KL 0.0001 (max 0.001), top-1 agreement 99.2%
+q4   : perplexity   10.409 over 238 tokens (246 s)
+q4 group 32 search vs bf16: mean KL 0.0522 (max 0.359), top-1 agreement 87.8%
+q4   : perplexity    8.979 over 238 tokens (60 s)
+q4 group 32 asym vs bf16: mean KL 0.0201 (max 0.430), top-1 agreement 90.3%
+q4   : perplexity    9.010 over 238 tokens (310 s)
+q4 group 32 search asym vs bf16: mean KL 0.0176 (max 0.517), top-1 agreement 89.5%
+q4   : perplexity    9.799 over 238 tokens (259 s)
+q4 group 128 search vs bf16: mean KL 0.0603 (max 1.377), top-1 agreement 88.7%
+# lower-bit options (asym, fp16 scale+offset per group; bits/weight = b + 32/group)
+q4   : perplexity    8.946 over 238 tokens (32 s)
+q4 group 64 asym vs bf16: mean KL 0.0235 (max 0.361), top-1 agreement 89.5%
+q4   : perplexity    8.853 over 238 tokens (55 s)
+q4 group 128 asym vs bf16: mean KL 0.0278 (max 0.445), top-1 agreement 90.3%
+q3   : perplexity    9.520 over 238 tokens (74 s)
+q3 group 32 asym vs bf16: mean KL 0.0876 (max 2.283), top-1 agreement 80.3%
+q3   : perplexity    9.476 over 238 tokens (29 s)
+q3 group 64 asym vs bf16: mean KL 0.1204 (max 2.692), top-1 agreement 79.0%
+q2   : perplexity   47.064 over 238 tokens (29 s)
+q2 group 32 asym vs bf16: mean KL 1.5461 (max 8.472), top-1 agreement 42.0%
