@@ -1065,3 +1065,17 @@ Our builds use LiteDRAM's MT41J256M16 class (same row/column geometry; what the 
 current litex-boards uses MT41K256M8. The factory design and litex-boards configure the banks as SSTL15; the rail
 was never measured with a meter. JEDEC tRFC for 2 Gbit is 160 ns; ddr3_module.MT41J256M16_ns uses 350 ns (chosen
 before the chips were identified), so a rebuild with 160 ns should free roughly another 2.5 % of bandwidth (untested).
+
+## 2026-11-10 Handover check: is everything needed in the repository?
+- Card: factory design, link 5 GT/s **x4** again at the 11-10 boot (also 11-04; x8 at the 11-02 boot). Our design
+  not loaded since 11-04, so the x8 Gen1 core is untested on this link state. Nothing running.
+- Checked against this PC: sources unchanged since the first repository commit; the tool patches are identical to
+  the installed trees' `git diff` (openFPGALoader, prjxray, nextpnr-xilinx; nextpnr's bundled prjxray-db has one extra
+  line, XF_REFCLK_31_10 in segbits_gtx_channel_2.db = the file in pcie/db/kintex7); LiteX checkouts unmodified.
+- Added: files the copy skipped by file type (litex/openocd_hs3_xc7.cfg for jtag_console.py, pcie/probe.ys now with
+  relative paths, accel/sim/Makefile.ffn, tests/{phase,pllphase,diag}/rom.hex); tools/toolchain_versions.txt,
+  tools/litex_commits.txt, tools/requirements-venv.txt; getting-started: check out the pinned commits, RISC-V GCC +
+  OpenOCD (xPack) step; PCIe stage scripts (s1, s2, run_probe): the factory comparison is optional (flash_v3.fasm),
+  a clear message when the settings files are missing, run_probe.sh no longer regenerates factory_params.vh
+  (make_params.sh does); docs/status.md (state, open problems, next ideas); ddr3_module.py docstring: 2 Gbit chips.
+- Not done: a full build from a fresh clone (checked by reading the scripts only).

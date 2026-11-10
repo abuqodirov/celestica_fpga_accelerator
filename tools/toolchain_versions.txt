@@ -1,0 +1,22 @@
+Toolchain on the PC that built and ran everything in this repository (recorded 2026-11-10).
+Install steps: docs/getting-started.md. Patches: patches/ (identical to the installed trees' git diff).
+
+OS                  Ubuntu 26.04, x86-64; Python 3.14.4 (venv ~/tools/venv, see requirements-venv.txt)
+Yosys               0.52 (git sha1 fee39a32, Ubuntu package) + patches/yosys-0.52-brams_xc6v_map.diff in ~/tools/yosys-fix
+Verilator           5.032 2025-01-01
+nextpnr-xilinx      github.com/openXC7/nextpnr-xilinx     bc9b234634cf80756b04ad4ea5f8e7a83293c425  + patches/nextpnr-xilinx.diff
+  bundled prjxray-db (xilinx/external/prjxray-db)        a90f27c1caefee5276f47440f4c730b50519a86f
+                    (our copy also has the 1-line XF_REFCLK_31_10 addition of pcie/db/kintex7/segbits_gtx_channel_2.db;
+                     builds use the overlay pcie/db/kintex7_llm, so a stock copy is fine)
+prjxray-db          github.com/openXC7/prjxray-db         517d66a383676cb971177ea92b0ff3b6ea6e8690  (standalone; base of the pcie/db/kintex7 overlay)
+Project X-Ray       github.com/f4pga/prjxray              c9f02d8576042325425824647ab5555b1bc77833  + patches/prjxray-gcc15.diff
+openFPGALoader      github.com/trabucayre/openFPGALoader  efb64ff5181c716267f098acd03f2daa57f6daba  + patches/openFPGALoader-xadc-kintex7.diff
+litex-boards        github.com/litex-hub/litex-boards     8215d8d9b4b23ed138b7e634bbf87ff2920c4221  (ypcb_00338_1p1 target)
+LiteX, LiteDRAM...  litex_setup.py --config=standard, pinned to tools/litex_commits.txt (no local changes)
+RISC-V GCC          xPack riscv-none-elf-gcc 15.2.0-1  (LiteX BIOS/firmware)
+                    https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v15.2.0-1/xpack-riscv-none-elf-gcc-15.2.0-1-linux-x64.tar.gz
+                    sha256 aaaa8060c914851a3e5ee1ba82cc3d6f80972f90638a05c6e823a37557a33758
+OpenOCD             xPack openocd 0.12.0-7  (LiteX JTAG console, litex/jtag_console.py)
+                    https://github.com/xpack-dev-tools/openocd-xpack/releases/download/v0.12.0-7/xpack-openocd-0.12.0-7-linux-x64.tar.gz
+                    sha256 94b3790983beaf8ed57e646c0620dd66d705fddae03d290823a6ed3b439468d6
+Pinout reference    github.com/TiferKing/ypcb_00338_1p1_hack  8b13ecf71b7061dd43a2b1580f0caa469f64303f

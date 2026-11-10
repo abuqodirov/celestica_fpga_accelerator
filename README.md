@@ -69,6 +69,7 @@ the factory design, run `openFPGALoader -c digilent_hs3 -r`, or power-cycle the 
 
 | | |
 |---|---|
+| [docs/status.md](docs/status.md) | **Start here if you take the project over:** current state, open problems, next ideas |
 | [docs/board.md](docs/board.md) | Hardware facts, pinout, clocks, LEDs, flash layout, health measurements |
 | [docs/getting-started.md](docs/getting-started.md) | Toolchain installation, build flow, first designs, troubleshooting |
 | [docs/ddr3.md](docs/ddr3.md) | DDR3 on both channels: what was wrong and the working recipe |
@@ -114,7 +115,8 @@ patches/     toolchain patches
 docs/        documentation
 ```
 
-Model weights, bitstreams and build outputs are not in the repository; the scripts download or build them
+Exact tool versions: [`tools/toolchain_versions.txt`](tools/toolchain_versions.txt). Model weights, bitstreams and
+build outputs are not in the repository; the scripts download or build them
 (see the docs). The scripts assume this repository is cloned to `~/celestica` and the tools are installed under
 `~/tools` as described in [docs/getting-started.md](docs/getting-started.md).
 

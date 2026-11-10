@@ -1,0 +1,14 @@
+# Verilator builds of the FFN unit testbenches: obj_ffn/tb (whole unit), obj_silu/tb (float pipeline), obj_fp32/tb
+RTL = ../rtl/ffn_unit.v ../rtl/fp32.v ../rtl/ffn_tables.vh
+V = verilator --cc -I../rtl -O3 -Wall -Wno-UNUSEDSIGNAL -Wno-DECLFILENAME -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -CFLAGS -O2 --build -j 2 -o tb
+all: obj_ffn/tb obj_silu/tb obj_fp32/tb
+obj_ffn/tb: $(RTL) tb_ffn.cpp
+	$(V) ../rtl/ffn_unit.v ../rtl/fp32.v --top-module ffn_unit --exe tb_ffn.cpp --Mdir obj_ffn > obj_ffn.log 2>&1 || (tail -20 obj_ffn.log; false)
+obj_silu/tb: $(RTL) tb_silu.cpp
+	$(V) ../rtl/ffn_unit.v ../rtl/fp32.v --top-module silu_mul --exe tb_silu.cpp --Mdir obj_silu > obj_silu.log 2>&1 || (tail -20 obj_silu.log; false)
+obj_fp32/tb: ../rtl/fp32.v tb_fp32.cpp tb_fp32_top.v
+	$(V) -Wno-MULTITOP ../rtl/fp32.v tb_fp32_top.v --top-module tb_fp32_top --exe tb_fp32.cpp --Mdir obj_fp32 > obj_fp32.log 2>&1 || (tail -20 obj_fp32.log; false)
+test: all
+	./obj_fp32/tb 10 1 && ./obj_silu/tb vectors/ffn_random.bin && ./obj_ffn/tb vectors/ffn_random.bin 8 1 && ./obj_ffn/tb vectors/ffn_random.bin 30 2
+clean:
+	rm -rf obj_ffn obj_silu obj_fp32 obj_ffn.log obj_silu.log obj_fp32.log

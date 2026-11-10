@@ -1,0 +1,3 @@
+read_verilog -I. probe_top.v
+synth_xilinx -flatten -abc9 -nosrl -arch xc7 -top probe_top
+write_json probe.json

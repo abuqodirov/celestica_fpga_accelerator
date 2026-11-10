@@ -19,7 +19,14 @@ The scripts in this repository assume:
 | openFPGALoader | v1.1.1 `efb64ff` + XADC patch | load bitstreams, status, XADC, flash read |
 | LiteX / LiteDRAM | 2026.8 (`litex_setup.py --config=standard`) | SoC, DDR3 controller |
 | Verilator | 5.032 | testbenches |
+| RISC-V GCC | xPack `riscv-none-elf-gcc` 15.2.0-1 | LiteX BIOS / firmware |
+| OpenOCD | xPack 0.12.0-7 | LiteX JTAG console (`litex/jtag_console.py`) |
 | Python | 3.14; numpy 2.5, migen 0.9.2, pyftdi 0.57, fasm 0.0.2; torch + tokenizers for the LLMs | host software |
+
+Exact commits of every tool, download links and checksums: [`tools/toolchain_versions.txt`](../tools/toolchain_versions.txt);
+LiteX/Migen commits: [`tools/litex_commits.txt`](../tools/litex_commits.txt); Python packages:
+[`tools/requirements-venv.txt`](../tools/requirements-venv.txt). The patches apply to exactly these commits, so the
+steps below check them out.
 
 **Note on nextpnr:** nextpnr-xilinx is now archived; development continues in
 [openXC7/nextpnr](https://github.com/openXC7/nextpnr) (`himbaechel` xilinx). Two of our three nextpnr fixes are
@@ -47,6 +54,7 @@ upstream build below.
 ```bash
 mkdir -p ~/tools && cd ~/tools
 git clone https://github.com/trabucayre/openFPGALoader.git && cd openFPGALoader
+git checkout efb64ff
 git apply ~/celestica/patches/openFPGALoader-xadc-kintex7.diff
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$HOME/.local
 ninja -C build install
@@ -59,6 +67,7 @@ Put `~/.local/bin` before `/usr/bin` in `PATH`, or call `~/.local/bin/openFPGALo
 ```bash
 cd ~/tools
 git clone https://github.com/openXC7/nextpnr-xilinx.git && cd nextpnr-xilinx
+git checkout bc9b234                 # the commit we used (the repository is archived)
 git submodule update --init --depth 1
 git apply ~/celestica/patches/nextpnr-xilinx.diff
 cmake -B build -G Ninja -DARCH=xilinx -DBUILD_GUI=OFF -DCMAKE_BUILD_TYPE=Release
@@ -76,6 +85,7 @@ rm ~/tools/chipdb/xc7k480t.bba
 ```bash
 cd ~/tools
 git clone https://github.com/f4pga/prjxray.git && cd prjxray
+git checkout c9f02d8
 git submodule update --init --recursive --depth 1
 git apply ~/celestica/patches/prjxray-gcc15.diff      # GCC 15: <cstdint>, no -Werror
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
@@ -90,10 +100,30 @@ python3 -m venv ~/tools/venv
 mkdir -p ~/tools/litex && cd ~/tools/litex
 wget https://raw.githubusercontent.com/enjoy-digital/litex/master/litex_setup.py
 ~/tools/venv/bin/python litex_setup.py --init --install --config=standard
-# for the LLM tools: ~/tools/venv/bin/pip install torch tokenizers
+# pin LiteX, LiteDRAM, Migen, ... to the commits we used (LiteX changes quickly; ypcb_soc.py uses LiteDRAM internals)
+while read d c; do case $d in '#'*|'') continue;; esac; git -C ~/tools/litex/$d checkout -q $c; done \
+    < ~/celestica/tools/litex_commits.txt
+# for the LLM tools (CPU-only torch is enough):
+~/tools/venv/bin/pip install torch tokenizers huggingface_hub
 ```
 
+`tools/requirements-venv.txt` lists every package version we had, if something does not import.
+
 The warning "Unable to import fast Antlr4 parser" from `fasm` is harmless.
+
+### 5b. RISC-V GCC and OpenOCD (for LiteX SoCs)
+
+LiteX compiles its BIOS with a RISC-V GCC, and `litex/jtag_console.py` talks to the SoC through OpenOCD.
+`litex/env.sh` expects the xPack builds at these paths:
+
+```bash
+mkdir -p ~/tools/dl ~/tools/riscv ~/tools/openocd && cd ~/tools/dl
+wget https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/releases/download/v15.2.0-1/xpack-riscv-none-elf-gcc-15.2.0-1-linux-x64.tar.gz
+wget https://github.com/xpack-dev-tools/openocd-xpack/releases/download/v0.12.0-7/xpack-openocd-0.12.0-7-linux-x64.tar.gz
+sha256sum *.tar.gz     # compare with tools/toolchain_versions.txt
+tar -xzf xpack-riscv-none-elf-gcc-15.2.0-1-linux-x64.tar.gz -C ~/tools/riscv
+tar -xzf xpack-openocd-0.12.0-7-linux-x64.tar.gz -C ~/tools/openocd
+```
 
 ### 6. Yosys with the RAMB36 fix (only if your yosys is older than 0.65)
 

@@ -81,6 +81,10 @@ There's no driver: the PC maps BAR0 (`/sys/bus/pci/devices/0000:01:00.0/resource
   rescan script sets it to `on`.
 - Reloading the FPGA while the PC runs only ever caused a few *correctable* PCIe errors. Never remove the card
   while the PC is on.
+- Check the link after every boot: `cat /sys/bus/pci/devices/0000:01:00.0/current_link_{speed,width}`. On our PC
+  the factory design trained x8 at 5 GT/s (last recorded at the 11-02 boot); at the boots on 11-04 and 11-10 only **x4**
+  (kernel: "limited by 5.0 GT/s PCIe x4 link", no errors logged). Cause unknown (seating, slot or BIOS); our own
+  x8 Gen1 design has not been loaded since. If it stays x4, reseat the card with the PC switched off.
 - Python's `memcpy` onto the mapped BAR sent one byte per packet; write with 32-bit or wider stores
   (`pcie_io.c`).
 
@@ -99,6 +103,19 @@ pcie/make_params.sh factory.bit                                                 
 This writes `pcie/factory_params.vh`, `pcie/s2/s2_params.vh` and `pcie/core/pcie_x8_params.vh`. All the PCIe designs
 include them, and `git` ignores them. Keep them, and `factory.bit`, to yourself: they come from the makers' design.
 We checked the script against our own files: the output is byte-identical.
+
+### Optional: compare with the factory design
+
+`pcie/run_probe.sh`, `pcie/s1/build.sh` and `pcie/s2/build.sh` end with a bit-by-bit comparison of the transceiver
+and PCIe tiles against the factory design. They skip it unless the full decode of your factory bitstream is there:
+
+```bash
+. litex/env.sh
+python3 ~/tools/prjxray/utils/bit2fasm.py --db-root pcie/db/kintex7_llm --part xc7k480tffg1156-2 \
+    --bitread ~/tools/prjxray/build/tools/bitread --verbose factory.bit > pcie/flash_v3.fasm
+```
+
+Like the settings files, it is git-ignored (`*.fasm`); keep it to yourself.
 
 ### Place and route
 

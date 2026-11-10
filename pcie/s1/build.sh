@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 P=xc7k480tffg1156-2
 DB=$PWD/../db/kintex7          # overlay DB, see ../db/README.txt
 mkdir -p build
+[ -s ../factory_params.vh ] || { echo "missing pcie/factory_params.vh: run pcie/make_params.sh <factory .bit> first (docs/pcie.md)"; exit 1; }
 yosys -q -l build/yosys.log -p "read_verilog -I .. s1_top.v; synth_xilinx -flatten -abc9 -nosrl -arch xc7 -top s1_top; stat; write_json build/s1.json"
 timeout 1800 nextpnr-xilinx --json build/s1.json --xdc s1.xdc --fasm build/s1.fasm --chipdb $CHIPDB/$P.bin \
     --seed 1 --freq 250 --timing-allow-fail --log build/pnr.log > /dev/null
@@ -16,7 +17,13 @@ fasm2frames --part $P --db-root $DB build/s1_patched.fasm > build/s1.frames 2> b
 xc7frames2bit --part_file $DB/$P/part.yaml --part_name $P --frm_file build/s1.frames --output_file build/s1.bit
 python3 ~/tools/prjxray/utils/bit2fasm.py --db-root $DB --part $P --bitread ~/tools/prjxray/build/tools/bitread \
     --verbose build/s1.bit > build/s1_verbose.fasm
-python3 ../compare_tiles.py ../flash_v3.fasm build/s1_verbose.fasm > build/compare.txt
-grep '^==' build/compare.txt
-python3 check_ties.py build/s1_patched.fasm | tail -40
+# Optional check against the factory design: needs ../flash_v3.fasm = bit2fasm of YOUR card's factory bitstream
+# (docs/pcie.md, "Optional: compare with the factory design"); skipped without it.
+if [ -f ../flash_v3.fasm ]; then
+    python3 ../compare_tiles.py ../flash_v3.fasm build/s1_verbose.fasm > build/compare.txt
+    grep '^==' build/compare.txt
+    python3 check_ties.py build/s1_patched.fasm | tail -40
+else
+    echo "no ../flash_v3.fasm: skipping the comparison with the factory design (optional)"
+fi
 ls -la build/s1.bit
